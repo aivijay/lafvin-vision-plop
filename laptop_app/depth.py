@@ -62,6 +62,8 @@ class DepthEngine:
         self.max_depth = max_depth
         self.config = MODEL_CONFIGS[encoder]
         self._warmup_done = False
+        self._inference_lock = False
+        self._cached_colorized_jpg = b''
 
     def load_model(self):
         if self.model is None:
@@ -229,53 +231,46 @@ class DepthEngine:
         return pixels
 
     def get_colorized_depth_jpg(self, jpg_bytes: bytes) -> bytes:
-        """Return a colorized depth JPEG for display."""
-        nparr = np.frombuffer(jpg_bytes, np.uint8)
-        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        if img is None:
-            return b""
+        """Return a colorized depth JPEG for display. Cached — skip if inference in progress."""
+        if self._inference_lock:
+            return self._cached_colorized_jpg or b''
 
-        h, w = img.shape[:2]
-        raw_depth = self._inference(img)
-        valid = raw_depth[raw_depth > 0.05]
-        min_d = float(np.min(valid)) if len(valid) > 0 else 0.0
-        max_d = float(np.max(valid)) if len(valid) > 0 else 5.0
-        if max_d <= min_d:
-            max_d = min_d + 5.0
+        self._inference_lock = True
+        try:
+            nparr = np.frombuffer(jpg_bytes, np.uint8)
+            img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            if img is None:
+                return b''
 
-        # Depth Anything V2: large value = NEAR (close), small value = FAR
-        # Near = RED (danger), Far = BLACK (safe)
-        # t=0 → FAR=BLACK, t=1 → NEAR=RED
-        stops_bgr = [
-            [0,   0,   0],    # t=0.00: FAR=BLACK
-            [255, 0,   0],    # t=0.17: BLUE
-            [255, 255, 0],    # t=0.33: CYAN
-            [0,   255, 0],    # t=0.50: GREEN
-            [0,   255, 255],  # t=0.67: YELLOW
-            [0,   165, 255],  # t=0.83: ORANGE
-            [0,   0,   255],  # t=1.00: NEAR=RED
-        ]
+            h, w = img.shape[:2]
+            raw_depth = self._inference(img)
 
-        colorized = np.zeros((h, w, 3), dtype=np.uint8)
-        for y in range(h):
-            for x in range(w):
-                v = raw_depth[y, x]
-                if v <= 0.05 or v > 20:
-                    # Very near → clamp to NEAR (RED), very far → FAR (BLACK)
-                    t = 0.0 if v > 20 else 1.0
-                else:
-                    # Map: large value (near) → t=1.0 (RED), small value (far) → t=0.0 (BLACK)
-                    t = (v - min_d) / (max_d - min_d) if max_d > min_d else 0.5
-                scaled = t * (len(stops_bgr) - 1)
-                i = min(int(scaled), len(stops_bgr) - 2)
-                f = scaled - i
-                r = int(stops_bgr[i][2] * (1-f) + stops_bgr[i+1][2] * f)
-                g = int(stops_bgr[i][1] * (1-f) + stops_bgr[i+1][1] * f)
-                b = int(stops_bgr[i][0] * (1-f) + stops_bgr[i+1][0] * f)
-                colorized[y, x] = [b, g, r]
+            valid = raw_depth[raw_depth > 0.05]
+            min_d = float(np.min(valid)) if len(valid) > 0 else 0.0
+            max_d = float(np.max(valid)) if len(valid) > 0 else 5.0
+            if max_d <= min_d:
+                max_d = min_d + 5.0
 
-        ret, buf = cv2.imencode('.jpg', colorized, [cv2.IMWRITE_JPEG_QUALITY, 85])
-        return bytes(buf) if ret else b""
+            # ── Vectorized colorization: normalize → LUT → remap ──────────────────
+            t = np.clip((raw_depth - min_d) / (max_d - min_d + 1e-8), 0, 1)
+            t = (t * 255).astype(np.uint8)
+
+            # 7-stop rainbow: BLACK → BLUE → CYAN → GREEN → YELLOW → ORANGE → RED
+            lut_b = np.array([0, 255, 255, 0, 0, 0, 0], dtype=np.uint8)
+            lut_g = np.array([0, 0, 255, 255, 255, 165, 0], dtype=np.uint8)
+            lut_r = np.array([0, 0, 0, 0, 0, 255, 255], dtype=np.uint8)
+
+            b = cv2.LUT(t, lut_b)
+            g = cv2.LUT(t, lut_g)
+            r = cv2.LUT(t, lut_r)
+
+            colorized = np.stack([b, g, r], axis=-1)
+
+            ret, buf = cv2.imencode('.jpg', colorized, [cv2.IMWRITE_JPEG_QUALITY, 75])
+            self._cached_colorized_jpg = bytes(buf) if ret else b''
+            return self._cached_colorized_jpg
+        finally:
+            self._inference_lock = False
 
 
 _depth_engine = None

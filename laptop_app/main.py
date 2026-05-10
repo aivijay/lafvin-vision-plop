@@ -183,6 +183,7 @@ async def ws_updates(request: Request):
     latest_camera_b64 = ""
     latest_robot_status = {}
     latest_depth_result = None
+    inference_state = {"busy": False, "result": None}
     _camera_event = threading.Event()
     _lock = threading.Lock()
 
@@ -191,19 +192,26 @@ async def ws_updates(request: Request):
         nonlocal latest_camera_b64, latest_robot_status, latest_depth_result
         while True:
             try:
+                if inference_state["busy"]:
+                    # Previous inference still running — skip this cycle
+                    time.sleep(0.2)
+                    continue
+
                 now = time.time()
-                # Get camera frame from RPi
                 frame_data = rpi.get_camera_frame()
                 if frame_data and frame_data.get("image"):
                     b64 = frame_data["image"]
-                    # Get robot status
                     try:
                         robot_status_data = rpi.get_status()
                     except Exception:
                         robot_status_data = {}
 
                     jpg_bytes = base64.b64decode(b64)
-                    depth_result = depth_engine.analyze(jpg_bytes)
+                    inference_state["busy"] = True
+                    try:
+                        depth_result = depth_engine.analyze(jpg_bytes)
+                    finally:
+                        inference_state["busy"] = False
 
                     with _lock:
                         latest_camera_b64 = b64

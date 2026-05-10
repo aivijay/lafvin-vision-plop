@@ -22,7 +22,7 @@ function initDepthCanvas() {
   depthCanvasCtx = canvas.getContext('2d');
   // Start polling for depth canvas updates
   if (depthPollInterval) clearInterval(depthPollInterval);
-  depthPollInterval = setInterval(pollDepthCanvas, 1500);
+  depthPollInterval = setInterval(pollDepthCanvas, 3000);
   pollDepthCanvas(); // immediate first poll
 }
 
