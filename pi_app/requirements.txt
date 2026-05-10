@@ -1,0 +1,4 @@
+# Pi app dependencies
+fastapi>=0.100
+uvicorn[standard]>=0.23
+sse-starlette>=1.8

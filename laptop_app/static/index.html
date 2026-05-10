@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>LAFVIN Vision HE</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div id="app">
+  <header>
+    <h1>🤖 LAFVIN Vision HE</h1>
+    <div class="header-right">
+      <span id="status" class="badge connecting">Connecting...</span>
+      <span id="fps-display">-- fps</span>
+      <span id="depth-fps">depth: --s</span>
+    </div>
+  </header>
+
+  <div class="grid">
+    <!-- Panel 1: Live Camera Feed -->
+    <div class="panel" id="panel-camera">
+      <div class="panel-title">📷 Camera Feed <span class="sub">via MJPEG</span></div>
+      <div class="panel-content">
+        <img id="camera-stream" src="/camera/live" alt="Live camera feed" />
+      </div>
+    </div>
+
+    <!-- Panel 2: Depth Map (colorized) -->
+    <div class="panel" id="panel-depth">
+      <div class="panel-title">🗺️ Depth Map <span class="sub">Depth Anything V2</span></div>
+      <div class="panel-content">
+        <canvas id="depth-canvas"></canvas>
+        <div id="depth-colorbar"></div>
+        <div id="depth-info" class="info-row">Loading depth model...</div>
+      </div>
+    </div>
+
+    <!-- Panel 3: Nav Planning -->
+    <div class="panel" id="panel-nav">
+      <div class="panel-title">🧭 Nav Planning</div>
+      <div class="panel-content">
+        <div id="nav-status" class="status-large">Loading...</div>
+        <div id="suggested-action" class="action-box">Action: --</div>
+        <div class="depth-readings">
+          <div class="reading">
+            <span class="reading-label">Center depth</span>
+            <span id="center-depth" class="reading-value">--</span>
+          </div>
+          <div class="reading">
+            <span class="reading-label">Obstacle %</span>
+            <span id="obstacle-pct" class="reading-value">--</span>
+          </div>
+          <div class="reading">
+            <span class="reading-label">Near cols</span>
+            <span id="near-pct" class="reading-value">--</span>
+          </div>
+        </div>
+        <div id="obstacle-detail" class="detail-text">--</div>
+
+        <div class="controls">
+          <button onclick="sendCommand('forward', 60)">⬆ Forward</button>
+          <button onclick="sendCommand('stop', 0)">⬛ Stop</button>
+          <button onclick="sendCommand('left', 50)">⬅ Left</button>
+          <button onclick="sendCommand('right', 50)">➡ Right</button>
+          <button onclick="sendCommand('backward', 60)">⬇ Back</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Panel 4: Robot Status -->
+    <div class="panel" id="panel-robot">
+      <div class="panel-title">🔧 Robot Status</div>
+      <div class="panel-content">
+        <div class="status-grid">
+          <div class="status-item">
+            <span class="label">Ultrasonic</span>
+            <span class="value" id="ultrasonic">-- cm</span>
+          </div>
+          <div class="status-item">
+            <span class="label">Motors</span>
+            <span class="value" id="motors">--</span>
+          </div>
+          <div class="status-item">
+            <span class="label">Gimbal H</span>
+            <span class="value" id="gimbal-h">--°</span>
+          </div>
+          <div class="status-item">
+            <span class="label">Gimbal V</span>
+            <span class="value" id="gimbal-v">--°</span>
+          </div>
+        </div>
+        <div class="robot-data">
+          <div>Clear path: <span id="clear-path">--</span></div>
+          <div>Obstacle: <span id="obstacle-flag">--</span></div>
+          <div>Depth model: <span id="model-status" style="color:#8b949e">Loading...</span></div>
+        </div>
+        <div id="calibration-info" class="calib-info">
+          calib: <span id="calib-params">--</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <footer>
+    <span id="last-update">Last update: --</span>
+    <span id="rpi-url">RPi: --</span>
+  </footer>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
