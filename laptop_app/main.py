@@ -17,6 +17,7 @@ import uvicorn
 
 from depth import get_depth_engine, load_calibration, save_calibration
 from robot_client import RobotClient
+import torch
 
 app = FastAPI(title="LAFVIN Vision HE", version="0.1.0")
 
@@ -27,6 +28,8 @@ app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 RPI_URL = os.environ.get("RPI_URL", "http://192.168.1.54:9000")
 rpi = RobotClient(RPI_URL)
 
+# Torch inter-op lock — prevents multiple threads doing torch inference simultaneously
+_torch_lock = threading.Lock()
 
 # ─── Camera (proxied from RPi) ────────────────────────────────────────────────
 
@@ -121,10 +124,12 @@ async def depth_colorized_jpg():
             return Response(content=b"", status_code=204)
         jpg_bytes = base64.b64decode(frame_data["image"])
 
-        # Run depth inference (may take ~1-2s on CPU)
+        # Run depth inference (may take ~1-2s on CPU) with torch lock to prevent
+        # thread contention — background_depth_loop and this endpoint both call into torch
         from depth import get_depth_engine
         engine = get_depth_engine()
-        color_jpg = engine.get_colorized_depth_jpg(jpg_bytes)
+        with _torch_lock:
+            color_jpg = engine.get_colorized_depth_jpg(jpg_bytes)
         if not color_jpg:
             return Response(content=b"", status_code=204)
         return Response(content=color_jpg, media_type="image/jpeg")
@@ -186,18 +191,14 @@ async def ws_updates(request: Request):
     inference_state = {"busy": False, "result": None}
     _camera_event = threading.Event()
     _lock = threading.Lock()
+    _camera_lock = threading.Lock()
+    _first_frame_ready = threading.Event()
 
-    def background_depth_loop():
-        """Continuously grab frames and run depth inference in background."""
-        nonlocal latest_camera_b64, latest_robot_status, latest_depth_result
+    def camera_poll_loop():
+        """Fast loop: poll camera + robot status at ~1s interval. Never blocked by inference."""
+        nonlocal latest_camera_b64, latest_robot_status
         while True:
             try:
-                if inference_state["busy"]:
-                    # Previous inference still running — skip this cycle
-                    time.sleep(0.2)
-                    continue
-
-                now = time.time()
                 frame_data = rpi.get_camera_frame()
                 if frame_data and frame_data.get("image"):
                     b64 = frame_data["image"]
@@ -205,39 +206,67 @@ async def ws_updates(request: Request):
                         robot_status_data = rpi.get_status()
                     except Exception:
                         robot_status_data = {}
-
-                    jpg_bytes = base64.b64decode(b64)
-                    inference_state["busy"] = True
-                    try:
-                        depth_result = depth_engine.analyze(jpg_bytes)
-                    finally:
-                        inference_state["busy"] = False
-
-                    with _lock:
+                    with _camera_lock:
                         latest_camera_b64 = b64
                         latest_robot_status = robot_status_data
-                        latest_depth_result = depth_result
+                        _first_frame_ready.set()
+                time.sleep(1.0)
+            except Exception as e:
+                print(f"[ws camera] error: {e}")
+                time.sleep(2)
 
-                    _camera_event.set()
+    def background_depth_loop():
+        """Run depth inference continuously. Camera/robot status handled by camera_poll_loop."""
+        nonlocal latest_depth_result
+        depth_engine = get_depth_engine()
+        while True:
+            try:
+                if inference_state["busy"]:
+                    time.sleep(0.2)
+                    continue
+
+                with _camera_lock:
+                    b64 = latest_camera_b64
+
+                if not b64:
+                    time.sleep(0.5)
+                    continue
+
+                jpg_bytes = base64.b64decode(b64)
+                inference_state["busy"] = True
+                try:
+                    # Torch inter-op lock prevents multiple threads in torch C++ backend
+                    with _torch_lock:
+                        depth_result = depth_engine.analyze(jpg_bytes)
+                finally:
+                    inference_state["busy"] = False
+
+                with _lock:
+                    latest_depth_result = depth_result
+
                 time.sleep(0.5)
             except Exception as e:
                 print(f"[ws depth] error: {e}")
                 time.sleep(1)
 
-    # Start background depth inference thread
+    # Start both threads
+    camera_thread = threading.Thread(target=camera_poll_loop, daemon=True)
+    camera_thread.start()
     depth_thread = threading.Thread(target=background_depth_loop, daemon=True)
     depth_thread.start()
 
     async def event_generator():
+        # Wait for camera thread to get first frame before sending events
+        _first_frame_ready.wait(timeout=10)
         while True:
             try:
                 now = time.time()
 
-                # Wait for fresh camera data (non-blocking check)
-                # Send whatever we have from the background thread
-                with _lock:
+                # Send whatever we have from the background threads
+                with _camera_lock:
                     camera_b64 = latest_camera_b64
                     robot_status = latest_robot_status
+                with _lock:
                     depth_result = latest_depth_result
 
                 event = {
@@ -253,7 +282,8 @@ async def ws_updates(request: Request):
                     "data": json.dumps(event),
                 }
 
-                await asyncio.sleep(0.2)
+                # SSE at ~2fps — gives depth loop enough time to produce results
+                await asyncio.sleep(0.5)
 
             except Exception as e:
                 print(f"[ws] error: {e}")

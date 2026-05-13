@@ -11,40 +11,30 @@ let fpsInterval = null;
 let lastDepthResult = null;
 let lastCameraB64 = "";
 
-// ─── Depth canvas polling ─────────────────────────────────────────────────────
-let depthCanvasCtx = null;
+// ─── Depth canvas — polled every 3s ─────────────────────────────────────────
+
 let depthPollInterval = null;
-let lastDepthImg = null;
 
 function initDepthCanvas() {
   const canvas = document.getElementById('depth-canvas');
   if (!canvas) return;
-  depthCanvasCtx = canvas.getContext('2d');
-  // Start polling for depth canvas updates
-  if (depthPollInterval) clearInterval(depthPollInterval);
-  depthPollInterval = setInterval(pollDepthCanvas, 3000);
-  pollDepthCanvas(); // immediate first poll
+  // Start polling the depth image
+  if (!depthPollInterval) {
+    depthPollInterval = setInterval(() => {
+      const ts = Date.now();
+      document.getElementById('depth-canvas').src = `/depth/colorized.jpg?t=${ts}`;
+    }, 3000);
+  }
 }
 
-async function pollDepthCanvas() {
-  if (!depthCanvasCtx) return;
-  try {
-    const resp = await fetch(`${SERVER}/depth/colorized.jpg?_=${Date.now()}`, { cache: 'no-store' });
-    if (!resp.ok || resp.status === 204) return;
-    const blob = await resp.blob();
-    if (lastDepthImg) lastDepthImg.remove();
-    const img = new Image();
-    img.onload = () => {
-      const canvas = document.getElementById('depth-canvas');
-      if (!canvas) return;
-      canvas.width = img.width;
-      canvas.height = img.height;
-      depthCanvasCtx.drawImage(img, 0, 0);
-    };
-    img.src = URL.createObjectURL(blob);
-    lastDepthImg = img;
-  } catch (e) {
-    // silent fail — depth will update on next poll
+// Called by handleUpdate() when SSE brings a fresh depth result
+function updateDepthCanvasFromSSE(depth) {
+  // Depth image is updated by the 3s polling interval above.
+  // This function is called to trigger an immediate refresh on new depth data.
+  const canvas = document.getElementById('depth-canvas');
+  if (canvas) {
+    const ts = Date.now();
+    canvas.src = `/depth/colorized.jpg?t=${ts}`;
   }
 }
 
@@ -132,6 +122,7 @@ function handleUpdate(data) {
     lastDepthResult = data.depth;
     updateDepthDisplay(data.depth);
     updateNavDisplay(data.depth);
+    updateDepthCanvasFromSSE(data.depth);
     document.getElementById('model-status').textContent = 'Ready (vits)';
   }
 }

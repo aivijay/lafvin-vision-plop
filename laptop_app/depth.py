@@ -84,14 +84,30 @@ class DepthEngine:
             print("[depth] Warmup done.")
 
     def _inference(self, img_bgr) -> np.ndarray:
-        h, w = img_bgr.shape[:2]
-        # Letterbox resize to 518x518 preserving 4:3 aspect ratio
-        target = 518
-        if h > w:
-            new_h, new_w = target, int(w * target / h)
+        orig_h, orig_w = img_bgr.shape[:2]
+
+        # ── Subsample to ~320px on longer side for faster inference ──
+        # Depth Anything was trained on 518px; going to 320px is ~62% the pixels
+        # but still produces good enough depth for navigation decisions.
+        # We keep the original dimensions separate and resize back at the end.
+        target_long = 320
+        if max(orig_h, orig_w) > target_long:
+            if orig_h > orig_w:
+                sub_h, sub_w = target_long, int(orig_w * target_long / orig_h)
+            else:
+                sub_h, sub_w = int(orig_h * target_long / orig_w), target_long
+            img_sub = cv2.resize(img_bgr, (sub_w, sub_h), interpolation=cv2.INTER_LINEAR)
         else:
-            new_h, new_w = int(h * target / w), target
-        resized = cv2.resize(img_bgr, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+            img_sub = img_bgr
+            sub_h, sub_w = orig_h, orig_w
+
+        # Letterbox resize to 518x518 preserving aspect ratio
+        target = 518
+        if sub_h > sub_w:
+            new_h, new_w = target, int(sub_w * target / sub_h)
+        else:
+            new_h, new_w = int(sub_h * target / sub_w), target
+        resized = cv2.resize(img_sub, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
         # Pad to square 518x518
         input_ = np.zeros((target, target, 3), dtype=np.uint8)
         y_off = (target - new_h) // 2
@@ -103,11 +119,11 @@ class DepthEngine:
         with torch.no_grad():
             depth = self.model(input_t)
         depth = depth.squeeze().cpu().numpy()
-        # Crop back to original aspect ratio
+        # Crop back to cropped region (remove padding)
         depth = cv2.resize(depth, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
         depth = depth[y_off:y_off+new_h, x_off:x_off+new_w]
         # Resize back to original camera resolution
-        depth = cv2.resize(depth, (w, h), interpolation=cv2.INTER_LINEAR)
+        depth = cv2.resize(depth, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
         return depth
 
     def analyze(self, jpg_bytes: bytes) -> dict:
@@ -251,26 +267,43 @@ class DepthEngine:
             if max_d <= min_d:
                 max_d = min_d + 5.0
 
-            # ── Vectorized colorization: normalize → LUT → remap ──────────────────
+            # Pre-computed 256-entry palette (class-level cache)
+            palette = self._build_palette()
+
+            # Map all pixels via the palette (vectorized)
             t = np.clip((raw_depth - min_d) / (max_d - min_d + 1e-8), 0, 1)
-            t = (t * 255).astype(np.uint8)
-
-            # 7-stop rainbow: BLACK → BLUE → CYAN → GREEN → YELLOW → ORANGE → RED
-            lut_b = np.array([0, 255, 255, 0, 0, 0, 0], dtype=np.uint8)
-            lut_g = np.array([0, 0, 255, 255, 255, 165, 0], dtype=np.uint8)
-            lut_r = np.array([0, 0, 0, 0, 0, 255, 255], dtype=np.uint8)
-
-            b = cv2.LUT(t, lut_b)
-            g = cv2.LUT(t, lut_g)
-            r = cv2.LUT(t, lut_r)
-
-            colorized = np.stack([b, g, r], axis=-1)
+            t_flat = (t * 255).astype(np.uint8).ravel()
+            flat = palette[t_flat]
+            colorized = flat.reshape(h, w, 3)
 
             ret, buf = cv2.imencode('.jpg', colorized, [cv2.IMWRITE_JPEG_QUALITY, 75])
             self._cached_colorized_jpg = bytes(buf) if ret else b''
             return self._cached_colorized_jpg
         finally:
             self._inference_lock = False
+
+    def _build_palette(self):
+        """Build the 256-entry BGR color palette once and cache it."""
+        if hasattr(self, '_palette_cache') and self._palette_cache is not None:
+            return self._palette_cache
+        # 7-stop color table (BGR order for OpenCV): BLACK, BLUE, CYAN, GREEN, YELLOW, ORANGE, RED
+        color_table = np.array([
+            [0,   0,   0],    # BLACK — far
+            [255, 0,   0],    # BLUE
+            [255, 255, 0],    # CYAN
+            [0,   255, 0],    # GREEN
+            [0,   255, 255],  # YELLOW
+            [0,   165, 255],  # ORANGE
+            [0,   0,   255],  # RED — near
+        ], dtype=np.uint8)
+        indices = np.linspace(0, 255, 7).astype(int)
+        palette = np.zeros((256, 3), dtype=np.uint8)
+        for i in range(7 - 1):
+            s, e = indices[i], indices[i+1]
+            f = np.arange(e - s + 1) / (e - s)
+            palette[s:e+1] = (color_table[i] * (1-f[:, None]) + color_table[i+1] * f[:, None]).astype(np.uint8)
+        self._palette_cache = palette
+        return palette
 
 
 _depth_engine = None
