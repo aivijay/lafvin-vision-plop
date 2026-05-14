@@ -198,7 +198,7 @@ async def ws_updates(request: Request):
                         latest_camera_b64 = b64
                         latest_robot_status = robot_status_data
                         _first_frame_ready.set()
-                time.sleep(0.25)
+                time.sleep(0.15)
             except Exception as e:
                 print(f"[ws camera] error: {e}")
                 time.sleep(2)
@@ -217,7 +217,7 @@ async def ws_updates(request: Request):
                     b64 = latest_camera_b64
 
                 if not b64:
-                    time.sleep(0.25)
+                    time.sleep(0.15)
                     continue
 
                 jpg_bytes = base64.b64decode(b64)
@@ -232,7 +232,7 @@ async def ws_updates(request: Request):
                 with _lock:
                     latest_depth_result = depth_result
 
-                time.sleep(0.25)
+                time.sleep(0.15)
             except Exception as e:
                 print(f"[ws depth] error: {e}")
                 time.sleep(1)
@@ -270,8 +270,8 @@ async def ws_updates(request: Request):
                     "data": json.dumps(event),
                 }
 
-                # SSE at ~2fps — gives depth loop enough time to produce results
-                await asyncio.sleep(0.5)
+                # SSE at ~3fps — camera polls at 0.15s, send updates as fast as they're ready
+                await asyncio.sleep(0.33)
 
             except Exception as e:
                 print(f"[ws] error: {e}")
