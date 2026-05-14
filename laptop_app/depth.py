@@ -191,6 +191,9 @@ class DepthEngine:
         # Build depth color map (for display)
         depth_color = self._colorize_depth(raw_depth, w, h)
 
+        # Store colorized JPEG in cache for /depth/colorized.jpg endpoint (fast read, no inference)
+        self._colorize_depth_to_jpg(raw_depth, w, h)
+
         return {
             "depth_m": round(median_depth, 3),
             "mean_depth_m": round(mean_depth, 3),
@@ -247,40 +250,27 @@ class DepthEngine:
         return pixels
 
     def get_colorized_depth_jpg(self, jpg_bytes: bytes) -> bytes:
-        """Return a colorized depth JPEG for display. Cached — skip if inference in progress."""
-        if self._inference_lock:
-            return self._cached_colorized_jpg or b''
+        """Return cached colorized JPEG. Inference runs once in background_depth_loop."""
+        return self._cached_colorized_jpg or b''
 
-        self._inference_lock = True
-        try:
-            nparr = np.frombuffer(jpg_bytes, np.uint8)
-            img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-            if img is None:
-                return b''
+    def _colorize_depth_to_jpg(self, raw_depth, w, h) -> bytes:
+        """Colorize raw depth array to JPEG, cache result. No inference."""
+        valid = raw_depth[raw_depth > 0.05]
+        min_d = float(np.min(valid)) if len(valid) > 0 else 0.0
+        max_d = float(np.max(valid)) if len(valid) > 0 else 5.0
+        if max_d <= min_d:
+            max_d = min_d + 5.0
 
-            h, w = img.shape[:2]
-            raw_depth = self._inference(img)
+        palette = self._build_palette()
 
-            valid = raw_depth[raw_depth > 0.05]
-            min_d = float(np.min(valid)) if len(valid) > 0 else 0.0
-            max_d = float(np.max(valid)) if len(valid) > 0 else 5.0
-            if max_d <= min_d:
-                max_d = min_d + 5.0
+        t = np.clip((raw_depth - min_d) / (max_d - min_d + 1e-8), 0, 1)
+        t_flat = (t * 255).astype(np.uint8).ravel()
+        flat = palette[t_flat]
+        colorized = flat.reshape(h, w, 3)
 
-            # Pre-computed 256-entry palette (class-level cache)
-            palette = self._build_palette()
-
-            # Map all pixels via the palette (vectorized)
-            t = np.clip((raw_depth - min_d) / (max_d - min_d + 1e-8), 0, 1)
-            t_flat = (t * 255).astype(np.uint8).ravel()
-            flat = palette[t_flat]
-            colorized = flat.reshape(h, w, 3)
-
-            ret, buf = cv2.imencode('.jpg', colorized, [cv2.IMWRITE_JPEG_QUALITY, 75])
-            self._cached_colorized_jpg = bytes(buf) if ret else b''
-            return self._cached_colorized_jpg
-        finally:
-            self._inference_lock = False
+        ret, buf = cv2.imencode('.jpg', colorized, [cv2.IMWRITE_JPEG_QUALITY, 75])
+        self._cached_colorized_jpg = bytes(buf) if ret else b''
+        return self._cached_colorized_jpg
 
     def _build_palette(self):
         """Build the 256-entry BGR color palette once and cache it."""

@@ -113,26 +113,14 @@ async def depth_analyze_colorized(request: Request):
 
 @app.get("/depth/colorized.jpg")
 async def depth_colorized_jpg():
-    """Return the latest colorized depth JPEG for canvas rendering."""
+    """Return cached colorized depth JPEG (no inference — computed in background_depth_loop)."""
     try:
-        # Fetch camera frame from RPi (non-blocking check)
-        try:
-            frame_data = rpi.get_camera_frame()
-        except Exception:
-            return Response(content=b"", status_code=204)
-        if not frame_data or not frame_data.get("image"):
-            return Response(content=b"", status_code=204)
-        jpg_bytes = base64.b64decode(frame_data["image"])
-
-        # Run depth inference (may take ~1-2s on CPU) with torch lock to prevent
-        # thread contention — background_depth_loop and this endpoint both call into torch
         from depth import get_depth_engine
         engine = get_depth_engine()
-        with _torch_lock:
-            color_jpg = engine.get_colorized_depth_jpg(jpg_bytes)
-        if not color_jpg:
+        jpg = engine.get_colorized_depth_jpg(b'')
+        if not jpg:
             return Response(content=b"", status_code=204)
-        return Response(content=color_jpg, media_type="image/jpeg")
+        return Response(content=jpg, media_type="image/jpeg")
     except Exception as e:
         print(f"[depth/colorized] error: {e}")
         return Response(content=b"", status_code=500)
@@ -210,7 +198,7 @@ async def ws_updates(request: Request):
                         latest_camera_b64 = b64
                         latest_robot_status = robot_status_data
                         _first_frame_ready.set()
-                time.sleep(1.0)
+                time.sleep(0.25)
             except Exception as e:
                 print(f"[ws camera] error: {e}")
                 time.sleep(2)
@@ -229,7 +217,7 @@ async def ws_updates(request: Request):
                     b64 = latest_camera_b64
 
                 if not b64:
-                    time.sleep(0.5)
+                    time.sleep(0.25)
                     continue
 
                 jpg_bytes = base64.b64decode(b64)
@@ -244,7 +232,7 @@ async def ws_updates(request: Request):
                 with _lock:
                     latest_depth_result = depth_result
 
-                time.sleep(0.5)
+                time.sleep(0.25)
             except Exception as e:
                 print(f"[ws depth] error: {e}")
                 time.sleep(1)
