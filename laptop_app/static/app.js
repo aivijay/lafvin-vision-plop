@@ -23,7 +23,7 @@ function initDepthCanvas() {
     depthPollInterval = setInterval(() => {
       const ts = Date.now();
       document.getElementById('depth-canvas').src = `/depth/colorized.jpg?t=${ts}`;
-    }, 3000);
+    }, 500);
   }
 }
 
@@ -71,7 +71,7 @@ function connectSSE() {
     setStatus('error');
     console.error('[SSE] error:', err);
     evtSource.close();
-    setTimeout(connectSSE, 3000);
+    setTimeout(connectSSE, 500);
   };
 }
 
