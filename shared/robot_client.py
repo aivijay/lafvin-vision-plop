@@ -50,7 +50,7 @@ class RobotClient:
             pass
         except Exception as e:
             print(f"[robot_client] get_status error: {e}")
-        return {"ultrasonic_cm": 0.0, "gimbal_h": 90, "gimbal_v": 90, "motors_on": False}
+        return {"ultrasonic_cm": 999, "gimbal_h": 90, "gimbal_v": 90, "motors_on": False}
 
     def send_command(self, action: str, speed: int = 50) -> dict:
         """Send command to RPi robot."""

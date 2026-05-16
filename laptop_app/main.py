@@ -194,6 +194,9 @@ async def ws_updates(request: Request):
                         robot_status_data = rpi.get_status()
                     except Exception:
                         robot_status_data = {}
+                    # Filter spurious ultrasonic readings at source (0cm = no echo/noise)
+                    raw_ultra = robot_status_data.get("ultrasonic_cm") or 999
+                    robot_status_data["ultrasonic_cm"] = raw_ultra if 2 <= raw_ultra <= 300 else 999
                     with _camera_lock:
                         latest_camera_b64 = b64
                         latest_robot_status = robot_status_data
@@ -256,6 +259,41 @@ async def ws_updates(request: Request):
                     robot_status = latest_robot_status
                 with _lock:
                     depth_result = latest_depth_result
+
+                # ── Fuse ultrasonic (authoritative for close-range) with vision ──
+                # Hysteresis: once obstacle detected, require stable clear readings to clear
+                _ultrasonic_history = getattr(event_generator, '_ultrasonic_history', [])
+                event_generator._ultrasonic_history = _ultrasonic_history
+                ULTRA_THRESHOLD = 30  # cm — only objects within 30cm are blocking
+                HYSTERESIS_COUNT = 4  # need this many consecutive clear readings to flip back
+                MIN_VALID = 2         # ignore readings below 2cm (noise/spurious)
+                MAX_VALID = 300       # ignore readings above 300cm (no echo / error)
+
+                raw_ultrasonic = robot_status.get("ultrasonic_cm") or 999
+                # Reject spurious 0cm and out-of-range readings before anything uses them
+                ultrasonic_cm = raw_ultrasonic if MIN_VALID <= raw_ultrasonic <= MAX_VALID else 999
+                # Also patch robot_status so frontend sees filtered value
+                robot_status = dict(robot_status)
+                robot_status["ultrasonic_cm"] = ultrasonic_cm
+                if depth_result:
+                    depth_result = dict(depth_result)
+                    if ultrasonic_cm < ULTRA_THRESHOLD:
+                        # Obstacle detected — reset hysteresis counter
+                        _ultrasonic_history.clear()
+                        depth_result["clear_path"] = False
+                        depth_result["obstacle_detected"] = True
+                        depth_result["suggested_action"] = "stop"
+                        depth_result["distance_to_obstacle_cm"] = ultrasonic_cm
+                        depth_result["obstacle_pct"] = max(depth_result.get("obstacle_pct", 0), 0.5)
+                    else:
+                        # Possibly clear — accumulate clear readings before trusting
+                        _ultrasonic_history.append(1)
+                        if len(_ultrasonic_history) < HYSTERESIS_COUNT:
+                            depth_result["clear_path"] = False
+                            depth_result["obstacle_detected"] = True
+                            depth_result["suggested_action"] = "stop"
+                        else:
+                            _ultrasonic_history.clear()  # reset after hysteresis passes
 
                 event = {
                     "camera": camera_b64,
