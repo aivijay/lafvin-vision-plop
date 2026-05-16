@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-Robot client — proxies requests to the RPi (192.168.1.54).
+Robot client — proxies requests to the RPi (192.168.1.170).
 """
 import requests
 import base64
 from typing import Optional
 
-RPI_URL = "http://192.168.1.54:9000"
+RPI_URL = "http://192.168.1.170:9000"
 TIMEOUT = 2
 
 

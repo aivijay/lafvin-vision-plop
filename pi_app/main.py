@@ -82,21 +82,22 @@ class CameraStream:
 # ─── Robot (from lafvin_robot_vision) ─────────────────────────────────────────
 
 ROBOT_BASE = "/home/vijay/lafvin_robot_vision"
-sys.path.insert(0, ROBOT_BASE)
+sys.path.insert(0, ROBOT_BASE + "/src")
 
 HARDWARE_OK = False
 try:
-    from src.common.hardware import (
+    from common.hardware import (
         ULTRASONIC_TRIG, ULTRASONIC_ECHO, SPEED_SLOW, SPEED_MEDIUM, SPEED_FAST
     )
-    from src.robot.motors import Motors
-    from src.robot.sensing import Sensing
-    from src.robot.servo import ServoGimbal
+    from robot.motors import Motors
+    from robot.ultrasonic import Ultrasonic, get_ultrasonic
+    from robot.servo_gimbal import ServoGimbal
     HARDWARE_OK = True
 except Exception as e:
     print(f"[robot] Hardware not available: {e}")
 
-_motors, _sensing, _gimbal = None, None, None
+_motors, _ultrasonic, _gimbal = None, None, None
+
 
 def get_motors():
     global _motors
@@ -104,11 +105,13 @@ def get_motors():
         _motors = Motors()
     return _motors
 
-def get_sensing():
-    global _sensing
-    if _sensing is None and HARDWARE_OK:
-        _sensing = Sensing()
-    return _sensing
+
+def get_ultrasonic_sensor():
+    global _ultrasonic
+    if _ultrasonic is None and HARDWARE_OK:
+        _ultrasonic = get_ultrasonic()
+    return _ultrasonic
+
 
 def get_gimbal():
     global _gimbal
@@ -116,27 +119,34 @@ def get_gimbal():
         _gimbal = ServoGimbal()
     return _gimbal
 
+
 def get_robot_status():
-    sensing = get_sensing()
+    ultrasonic = get_ultrasonic_sensor()
     gimbal = get_gimbal()
-    ultrasonic = 0.0
-    if sensing:
+
+    dist_cm = 0.0
+    if ultrasonic:
         try:
-            ultrasonic = sensing.read_distance()
-        except Exception:
-            pass
+            d = ultrasonic.read()
+            if d > 0:
+                dist_cm = d / 10.0  # mm -> cm
+        except Exception as e:
+            print(f"[ultrasonic] read error: {e}")
+
     h, v = 90, 90
     if gimbal:
         try:
-            h, v = gimbal.get_position()
-        except Exception:
-            pass
+            h, v = gimbal.h, gimbal.v
+        except Exception as e:
+            print(f"[gimbal] read error: {e}")
+
     return {
-        "ultrasonic_cm": round(ultrasonic, 1),
+        "ultrasonic_cm": round(dist_cm, 1),
         "gimbal_h": h,
         "gimbal_v": v,
         "motors_on": HARDWARE_OK,
     }
+
 
 def send_robot_command(action: str, speed: int = 50):
     motors = get_motors()
@@ -162,6 +172,7 @@ STATIC_DIR.mkdir(exist_ok=True)
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 _cam = None
+
 
 def get_cam():
     global _cam
@@ -209,6 +220,7 @@ async def robot_command(action: str = "stop", speed: int = 50):
 async def ws_updates():
     """SSE stream: camera frame + robot status."""
     async def gen():
+        import asyncio
         cam = get_cam()
         while True:
             jpg = cam.get_jpg()
@@ -222,7 +234,6 @@ async def ws_updates():
             yield {"event": "update", "data": data}
             await asyncio.sleep(0.2)
 
-    import asyncio
     return EventSourceResponse(gen())
 
 

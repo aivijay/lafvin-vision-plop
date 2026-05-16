@@ -25,7 +25,7 @@ STATIC_DIR = Path(__file__).parent / "static"
 STATIC_DIR.mkdir(exist_ok=True)
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
-RPI_URL = os.environ.get("RPI_URL", "http://192.168.1.54:9000")
+RPI_URL = os.environ.get("RPI_URL", "http://192.168.1.170:9000")
 rpi = RobotClient(RPI_URL)
 
 # Torch inter-op lock — prevents multiple threads doing torch inference simultaneously
@@ -266,7 +266,6 @@ async def ws_updates(request: Request):
                     event["depth"] = depth_result
 
                 yield {
-                    "event": "update",
                     "data": json.dumps(event),
                 }
 
