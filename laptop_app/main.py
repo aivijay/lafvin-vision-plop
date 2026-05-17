@@ -207,26 +207,25 @@ async def ws_updates(request: Request):
                 time.sleep(2)
 
     def background_depth_loop():
-        """Run depth inference continuously. Camera/robot status handled by camera_poll_loop."""
+        """Run depth inference at 1fps. Camera/robot status handled by camera_poll_loop."""
         nonlocal latest_depth_result
         depth_engine = get_depth_engine()
         while True:
             try:
                 if inference_state["busy"]:
-                    time.sleep(0.2)
+                    time.sleep(1.0)
                     continue
 
                 with _camera_lock:
                     b64 = latest_camera_b64
 
                 if not b64:
-                    time.sleep(0.15)
+                    time.sleep(0.5)
                     continue
 
                 jpg_bytes = base64.b64decode(b64)
                 inference_state["busy"] = True
                 try:
-                    # Torch inter-op lock prevents multiple threads in torch C++ backend
                     with _torch_lock:
                         depth_result = depth_engine.analyze(jpg_bytes)
                 finally:
@@ -235,10 +234,10 @@ async def ws_updates(request: Request):
                 with _lock:
                     latest_depth_result = depth_result
 
-                time.sleep(0.15)
+                time.sleep(1.0)  # 1fps — enough for nav planning
             except Exception as e:
                 print(f"[ws depth] error: {e}")
-                time.sleep(1)
+                time.sleep(2)
 
     # Start both threads
     camera_thread = threading.Thread(target=camera_poll_loop, daemon=True)
@@ -260,43 +259,39 @@ async def ws_updates(request: Request):
                 with _lock:
                     depth_result = latest_depth_result
 
-                # ── Fuse ultrasonic (authoritative for close-range) with vision ──
-                # Hysteresis: once obstacle detected, require stable clear readings to clear
-                _ultrasonic_history = getattr(event_generator, '_ultrasonic_history', [])
-                event_generator._ultrasonic_history = _ultrasonic_history
-                ULTRA_THRESHOLD = 30  # cm — only objects within 30cm are blocking
-                HYSTERESIS_COUNT = 4  # need this many consecutive clear readings to flip back
-                MIN_VALID = 2         # ignore readings below 2cm (noise/spurious)
-                MAX_VALID = 300       # ignore readings above 300cm (no echo / error)
+                # ── Ultrasonic-vision fusion ──────────────────────────────────────────
+                # Use median of last 4 readings for stability. 0cm is valid (emergency).
+                # Only override vision when ultrasonic sees something closer than
+                # what vision sees AND it's within 30cm.
+                _ultra_buf = getattr(event_generator, '_ultra_buf', [])
+                event_generator._ultra_buf = _ultra_buf
 
-                raw_ultrasonic = robot_status.get("ultrasonic_cm") or 999
-                # Reject spurious 0cm and out-of-range readings before anything uses them
-                ultrasonic_cm = raw_ultrasonic if MIN_VALID <= raw_ultrasonic <= MAX_VALID else 999
-                # Also patch robot_status so frontend sees filtered value
-                robot_status = dict(robot_status)
-                robot_status["ultrasonic_cm"] = ultrasonic_cm
+                raw_ultra = robot_status.get("ultrasonic_cm", 999)
+                _ultra_buf.append(raw_ultra)
+                if len(_ultra_buf) > 4:
+                    _ultra_buf.pop(0)
+
+                # Median of last 4 readings — stable, handles 0cm legitimately
+                sorted_buf = sorted(_ultra_buf)
+                median_ultra = sorted_buf[len(sorted_buf) // 2]
+
                 if depth_result:
                     depth_result = dict(depth_result)
-                    if ultrasonic_cm < ULTRA_THRESHOLD:
-                        # Obstacle detected — reset hysteresis counter
-                        _ultrasonic_history.clear()
+                    vision_dist = depth_result.get("distance_to_obstacle_cm", 999)
+
+                    if median_ultra < 30 and median_ultra < vision_dist:
+                        # Ultrasonic sees close obstacle — override vision
                         depth_result["clear_path"] = False
                         depth_result["obstacle_detected"] = True
                         depth_result["suggested_action"] = "stop"
-                        depth_result["distance_to_obstacle_cm"] = ultrasonic_cm
-                        depth_result["obstacle_pct"] = max(depth_result.get("obstacle_pct", 0), 0.5)
-                    else:
-                        # Possibly clear — accumulate clear readings before trusting
-                        _ultrasonic_history.append(1)
-                        if len(_ultrasonic_history) < HYSTERESIS_COUNT:
-                            depth_result["clear_path"] = False
-                            depth_result["obstacle_detected"] = True
-                            depth_result["suggested_action"] = "stop"
-                        else:
-                            _ultrasonic_history.clear()  # reset after hysteresis passes
+                        depth_result["distance_to_obstacle_cm"] = median_ultra
+                    # else: trust vision's own obstacle_pct / clear_path
+                    # (do NOT force obstacle_detected based on history here)
 
+                # SSE event — camera NOT relayed (browser uses <img src="/camera/live"> direct MJPEG from Pi)
+                # camera_b64 was ~450KB of wasted base64 per event, never used for display
                 event = {
-                    "camera": camera_b64,
+                    "event": "update",  # Buddy v1.0 fix: browser onmessage needs named event
                     "robot": robot_status,
                     "timestamp": now,
                 }
@@ -307,8 +302,9 @@ async def ws_updates(request: Request):
                     "data": json.dumps(event),
                 }
 
-                # SSE at ~3fps — camera polls at 0.15s, send updates as fast as they're ready
-                await asyncio.sleep(0.33)
+                # SSE at 1fps — matches depth inference rate (1 per second), robot status is stable
+                # Camera MJPEG shown via <img src="/camera/live"> direct from RPi, no SSE relay needed
+                await asyncio.sleep(1.0)
 
             except Exception as e:
                 print(f"[ws] error: {e}")

@@ -1,5 +1,6 @@
-// LAFVIN Vision HE — Laptop Frontend
-// Receives SSE: camera frame + depth analysis (from laptop) + robot status
+// LAFVIN Vision PLOP — Laptop Frontend
+// Receives SSE: robot status + depth (from laptop) + depth analysis
+// Camera shown via <img src="/camera/live"> direct MJPEG from RPi (not relayed through SSE)
 
 const SERVER = window.location.origin;
 
@@ -9,30 +10,22 @@ let connected = false;
 let frameCount = 0, depthCount = 0;
 let fpsInterval = null;
 let lastDepthResult = null;
-let lastCameraB64 = "";
 
-// ─── Depth canvas — polled every 3s ─────────────────────────────────────────
-
-let depthPollInterval = null;
+// ─── Depth canvas — updated on demand via SSE depth events ──────────────────
+// No polling — depth image only refreshed when SSE delivers a new depth result
+// Saves 120 HTTP requests/minute from eliminated 0.5s polling interval
 
 function initDepthCanvas() {
   const canvas = document.getElementById('depth-canvas');
   if (!canvas) return;
-  // Start polling the depth image
-  if (!depthPollInterval) {
-    depthPollInterval = setInterval(() => {
-      const ts = Date.now();
-      document.getElementById('depth-canvas').src = `/depth/colorized.jpg?t=${ts}`;
-    }, 500);
-  }
+  // No polling — updateDepthCanvasFromSSE() handles it when depth arrives via SSE
 }
 
 // Called by handleUpdate() when SSE brings a fresh depth result
 function updateDepthCanvasFromSSE(depth) {
-  // Depth image is updated by the 3s polling interval above.
-  // This function is called to trigger an immediate refresh on new depth data.
   const canvas = document.getElementById('depth-canvas');
-  if (canvas) {
+  if (canvas && depth) {
+    // Cache-bust to force browser reload of the new cached JPEG
     const ts = Date.now();
     canvas.src = `/depth/colorized.jpg?t=${ts}`;
   }
@@ -98,13 +91,6 @@ function startFPSCounter() {
 
 // ─── Handle SSE update ────────────────────────────────────────────────────────
 function handleUpdate(data) {
-  // Camera frame (from RPi, relayed through laptop app)
-  if (data.camera && data.camera !== lastCameraB64) {
-    lastCameraB64 = data.camera;
-    // Camera MJPEG stream is already shown via <img src="/camera/live">
-    // The base64 is available if we need to do canvas overlay
-  }
-
   // Robot status (from RPi)
   if (data.robot) {
     document.getElementById('ultrasonic').textContent =
@@ -192,7 +178,6 @@ async function sendCommand(action, speed) {
     });
     const result = await resp.json();
     console.log('[command]', action, result);
-    // Briefly flash the button
     return result;
   } catch (e) {
     console.error('[command] failed:', e);
