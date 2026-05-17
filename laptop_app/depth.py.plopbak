@@ -1,0 +1,364 @@
+#!/usr/bin/env python3
+"""
+Depth Anything V2 wrapper for laptop-side analysis.
+Uses ~/projects/depth-anything-v2/
+
+Supports three inference backends (priority order):
+  1. ONNX Runtime (CPU)     — fastest, ~30MB less RAM than PyTorch fp32
+  2. PyTorch fp16 (CPU)    — 50% RAM reduction vs fp32, minimal quality loss
+  3. PyTorch fp32 (CPU)    — baseline (original)
+"""
+import os, sys, time, json, base64
+import numpy as np
+import cv2
+from pathlib import Path
+
+DEPTH_PROJECT = os.path.expanduser("~/projects/depth-anything-v2")
+sys.path.insert(0, DEPTH_PROJECT)
+
+import torch
+from depth_anything_v2.dpt import DepthAnythingV2
+
+# ── Threading ──────────────────────────────────────────────────────────────────
+# Constrain PyTorch to available cores — prevents thread oversubscription
+_torch_threads = max(1, __import__('os').cpu_count() or 4)
+torch.set_num_threads(_torch_threads)
+try:
+    torch.set_num_interop_threads(_torch_threads)
+except AttributeError:
+    pass  # torch < 2.0 may not have set_num_interop_threads
+
+# ── Constants ──────────────────────────────────────────────────────────────────
+# ENCODER_TARGET must be divisible by 14 (ViT patch size).
+# 392 = 28×14 — official DA-V2 size, valid for both PyTorch and ONNX paths.
+ENCODER_TARGET = 392
+
+MODEL_CONFIGS = {
+    'vits': {'encoder': 'vits', 'features': 64, 'out_channels': [48, 96, 192, 384]},
+    'vitb': {'encoder': 'vitb', 'features': 128, 'out_channels': [96, 192, 384, 768]},
+    'vitl': {'encoder': 'vitl', 'features': 256, 'out_channels': [256, 512, 1024, 1024]},
+}
+
+# Smooth 4-zone scale-only calibration (no discontinuity)
+DEFAULT_CALIB = {
+    "thresholds": [2.5, 4.0, 4.3],
+    "scales": [0.408, 0.590, 1.000, 0.672]
+}
+CALIB_PATH = Path(os.path.expanduser("~/.lafvin_depth_calib.json"))
+
+
+def load_calibration():
+    if CALIB_PATH.exists():
+        return json.loads(CALIB_PATH.read_text())
+    return DEFAULT_CALIB
+
+
+def save_calibration(calib):
+    CALIB_PATH.write_text(json.dumps(calib, indent=2))
+
+
+def apply_calibration(raw_depth, calib):
+    t1, t2, t3 = calib["thresholds"]
+    s0, s1, s2, s3 = calib["scales"]
+    calibrated = np.zeros_like(raw_depth, dtype=np.float32)
+    m0 = raw_depth < t1
+    m1 = (raw_depth >= t1) & (raw_depth < t2)
+    m2 = (raw_depth >= t2) & (raw_depth < t3)
+    m3 = raw_depth >= t3
+    calibrated[m0] = raw_depth[m0] * s0
+    calibrated[m1] = raw_depth[m1] * s1
+    calibrated[m2] = raw_depth[m2] * s2
+    calibrated[m3] = raw_depth[m3] * s3
+    return np.maximum(calibrated, 0)
+
+
+# ── ONNX Backend ───────────────────────────────────────────────────────────────
+_CHECKPOINT_DIR = Path(DEPTH_PROJECT) / "checkpoints"
+
+class _ONNXEngine:
+    """Lightweight ONNX Runtime wrapper. Separate from the main DepthEngine."""
+
+    def __init__(self, encoder='vits'):
+        self.encoder = encoder
+        self.session = None
+
+    def load(self):
+        if self.session is None:
+            onnx_path = _CHECKPOINT_DIR / f"depth_anything_v2_{self.encoder}.onnx"
+            if not onnx_path.exists():
+                raise FileNotFoundError(
+                    f"ONNX model not found: {onnx_path}\n"
+                    "Run: python3 export_onnx.py"
+                )
+            import onnxruntime as ort
+            opts = ort.SessionOptions()
+            opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+            self.session = ort.InferenceSession(
+                str(onnx_path), sess_options=opts,
+                providers=['CPUExecutionProvider']
+            )
+            # Warm up
+            dummy = np.zeros((1, 3, 480, 640), dtype=np.uint8)
+            self.session.run(None, {'input': dummy})
+
+    def infer(self, img_bgr: np.ndarray) -> np.ndarray:
+        """
+        Run ONNX inference. Input: HxWx3 uint8 BGR. Output: HxW float32.
+        """
+        orig_h, orig_w = img_bgr.shape[:2]
+        input_t = np.transpose(img_bgr, (2, 0, 1))[np.newaxis, ...].astype(np.uint8)
+        # ONNX outputs [1, 1, ENCODER_TARGET, ENCODER_TARGET]
+        depth = self.session.run(None, {'input': input_t})[0][0, 0]  # [ET, ET]
+        # Resize back to original resolution
+        depth = cv2.resize(depth, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
+        return depth
+
+
+# ── Main DepthEngine ───────────────────────────────────────────────────────────
+
+class DepthEngine:
+    def __init__(self, encoder='vits', dataset='hypersim', use_fp16=False):
+        self.model = None
+        self.onnx_engine = None
+        self.device = "cpu"
+        self.encoder = encoder
+        self.dataset = dataset
+        self.use_fp16 = use_fp16
+        self.config = MODEL_CONFIGS[encoder]
+        self._warmup_done = False
+        self._cached_colorized_jpg = b''
+        self._calib = None
+
+    def load_model(self):
+        if self.model is None:
+            print("[depth] Loading Depth Anything V2 ({}/{})...".format(
+                self.dataset, self.encoder))
+
+            # Try ONNX first (fastest)
+            onnx_path = _CHECKPOINT_DIR / f"depth_anything_v2_{self.encoder}.onnx"
+            if onnx_path.exists():
+                try:
+                    self.onnx_engine = _ONNXEngine(self.encoder)
+                    self.onnx_engine.load()
+                    print("[depth] ONNX Runtime loaded (CPU).")
+                    return
+                except Exception as e:
+                    print(f"[depth] ONNX load failed ({e}), falling back to PyTorch.")
+
+            # Fall back to PyTorch
+            ckpt_path = _CHECKPOINT_DIR / f"depth_anything_v2_{self.encoder}.pth"
+            self.model = DepthAnythingV2(**self.config)
+            self.model.load_state_dict(torch.load(str(ckpt_path), map_location=self.device,
+                                                  weights_only=True))
+            self.model.to(self.device)
+            self.model.eval()
+
+            # FP16 if requested
+            if self.use_fp16:
+                self.model = self.model.half()
+                print("[depth] PyTorch fp16 loaded (half precision).")
+            else:
+                print("[depth] PyTorch fp32 loaded.")
+
+    def warmup(self):
+        if not self._warmup_done:
+            self._warmup_done = True
+
+    def _inference_pytorch(self, img_bgr) -> np.ndarray:
+        """
+        PyTorch inference path: letterbox resize to ENCODER_TARGET + inference.
+        """
+        orig_h, orig_w = img_bgr.shape[:2]
+
+        # Letterbox resize: longer side → ENCODER_TARGET
+        if orig_h > orig_w:
+            new_h, new_w = ENCODER_TARGET, int(orig_w * ENCODER_TARGET / orig_h)
+        else:
+            new_h, new_w = int(orig_h * ENCODER_TARGET / orig_w), ENCODER_TARGET
+
+        resized = cv2.resize(img_bgr, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+
+        # Pad to ENCODER_TARGET × ENCODER_TARGET (center pad)
+        pad_h = ENCODER_TARGET - new_h
+        pad_w = ENCODER_TARGET - new_w
+        pt = pad_h // 2
+        pl = pad_w // 2
+        padded = np.zeros((ENCODER_TARGET, ENCODER_TARGET, 3), dtype=np.uint8)
+        padded[pt:pt+new_h, pl:pl+new_w] = resized
+
+        # Inference
+        input_t = torch.from_numpy(padded).permute(2, 0, 1).float().unsqueeze(0) / 255.0
+        if self.use_fp16:
+            input_t = input_t.half()
+        with torch.no_grad():
+            depth = self.model(input_t).squeeze().cpu().numpy()
+
+        # Crop back to letterboxed region
+        depth = cv2.resize(depth, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+        depth = depth[pt:pt+new_h, pl:pl+new_w]
+
+        # Resize back to original camera resolution
+        depth = cv2.resize(depth, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
+        return depth
+
+    def _inference(self, img_bgr) -> np.ndarray:
+        """
+        Run depth inference. Uses ONNX if available, otherwise PyTorch.
+        Returns HxW float32 depth map (relative values).
+        """
+        if self.onnx_engine is not None:
+            return self.onnx_engine.infer(img_bgr)
+        return self._inference_pytorch(img_bgr)
+
+    def infer_fp16(self, img_bgr) -> np.ndarray:
+        """Explicit fp16 inference (bypasses self.use_fp16)."""
+        orig_h, orig_w = img_bgr.shape[:2]
+
+        if orig_h > orig_w:
+            new_h, new_w = ENCODER_TARGET, int(orig_w * ENCODER_TARGET / orig_h)
+        else:
+            new_h, new_w = int(orig_h * ENCODER_TARGET / orig_w), ENCODER_TARGET
+
+        resized = cv2.resize(img_bgr, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+        pad_h = ENCODER_TARGET - new_h
+        pad_w = ENCODER_TARGET - new_w
+        pt = pad_h // 2
+        pl = pad_w // 2
+        padded = np.zeros((ENCODER_TARGET, ENCODER_TARGET, 3), dtype=np.uint8)
+        padded[pt:pt+new_h, pl:pl+new_w] = resized
+
+        input_t = torch.from_numpy(padded).permute(2, 0, 1).float().unsqueeze(0) / 255.0
+        input_t = input_t.half()
+        with torch.no_grad():
+            depth = self.model(input_t).squeeze().cpu().float().numpy()
+
+        depth = cv2.resize(depth, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+        depth = depth[pt:pt+new_h, pl:pl+new_w]
+        depth = cv2.resize(depth, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
+        return depth
+
+    def analyze(self, jpg_bytes: bytes) -> dict:
+        """Full analysis: depth + nav planning."""
+        self.load_model()
+        self.warmup()
+
+        nparr = np.frombuffer(jpg_bytes, np.uint8)
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        if img is None:
+            return {"error": "decode_failed"}
+
+        h, w = img.shape[:2]
+
+        raw_depth = self._inference(img)
+        self._calib = load_calibration()
+        calib = self._calib
+        depth_cal = apply_calibration(raw_depth, calib)
+
+        # Nav: center strip, bottom half (floor area)
+        cx1, cx2 = w // 3, 2 * w // 3
+        center = depth_cal[:, cx1:cx2]
+        floor = center[h // 2:, :]
+
+        valid = floor[floor > 0.05]
+        if len(valid) == 0:
+            return {
+                "depth_m": 0.0, "clear_path": True, "obstacle_detected": False,
+                "suggested_action": "forward", "obstacle_pct": 0.0,
+                "distance_to_obstacle_cm": 500.0,
+                "calibration": calib, "img_h": h, "img_w": w
+            }
+
+        median_depth = float(np.median(valid))
+        mean_depth = float(np.mean(valid))
+
+        obstacle_mask = floor < 0.5
+        obstacle_pct = float(np.sum(obstacle_mask) / floor.size)
+
+        col_means = floor.mean(axis=0)
+        threshold_depth = 0.8
+        near_cols = np.sum(col_means < threshold_depth)
+        total_cols = len(col_means)
+        near_pct = near_cols / total_cols if total_cols > 0 else 0
+
+        if obstacle_pct > 0.20 or median_depth < 0.5:
+            action = "stop"
+            clear = False
+        elif obstacle_pct > 0.10 or near_pct > 0.15:
+            left_half = col_means[:len(col_means)//2]
+            right_half = col_means[len(col_means)//2:]
+            left_clear = np.sum(left_half > threshold_depth)
+            right_clear = np.sum(right_half > threshold_depth)
+            action = "turn_left" if left_clear > right_clear else "turn_right"
+            clear = False
+        else:
+            action = "forward"
+            clear = True
+
+        self._colorize_depth_to_jpg(raw_depth, w, h)
+
+        return {
+            "depth_m": round(median_depth, 3),
+            "mean_depth_m": round(mean_depth, 3),
+            "clear_path": clear,
+            "obstacle_detected": not clear,
+            "obstacle_pct": round(obstacle_pct, 3),
+            "suggested_action": action,
+            "distance_to_obstacle_cm": round(median_depth * 100, 1),
+            "near_pct": round(near_pct, 3),
+            "calibration": calib,
+            "img_h": h,
+            "img_w": w,
+        }
+
+    def _colorize_depth_to_jpg(self, raw_depth, w, h) -> bytes:
+        """Colorize raw depth array to JPEG, cache result. No inference."""
+        valid = raw_depth[raw_depth > 0.05]
+        min_d = float(np.min(valid)) if len(valid) > 0 else 0.0
+        max_d = float(np.max(valid)) if len(valid) > 0 else 5.0
+        if max_d <= min_d:
+            max_d = min_d + 5.0
+
+        palette = self._build_palette()
+        t = np.clip((raw_depth - min_d) / (max_d - min_d + 1e-8), 0, 1)
+        t_flat = (t * 255).astype(np.uint8).ravel()
+        flat = palette[t_flat]
+        colorized = flat.reshape(h, w, 3)
+
+        ret, buf = cv2.imencode('.jpg', colorized, [cv2.IMWRITE_JPEG_QUALITY, 75])
+        self._cached_colorized_jpg = bytes(buf) if ret else b''
+        return self._cached_colorized_jpg
+
+    def _build_palette(self):
+        if hasattr(self, '_palette_cache') and self._palette_cache is not None:
+            return self._palette_cache
+        color_table = np.array([
+            [0,   0,   0],
+            [255, 0,   0],
+            [255, 255, 0],
+            [0,   255, 0],
+            [0,   255, 255],
+            [0,   165, 255],
+            [0,   0,   255],
+        ], dtype=np.uint8)
+        indices = np.linspace(0, 255, 7).astype(int)
+        palette = np.zeros((256, 3), dtype=np.uint8)
+        for i in range(7 - 1):
+            s, e = indices[i], indices[i+1]
+            f = np.arange(e - s + 1) / (e - s)
+            palette[s:e+1] = (color_table[i] * (1-f[:, None]) +
+                               color_table[i+1] * f[:, None]).astype(np.uint8)
+        self._palette_cache = palette
+        return palette
+
+    def get_colorized_depth_jpg(self, jpg_bytes: bytes = b'') -> bytes:
+        """Return cached colorized JPEG."""
+        return self._cached_colorized_jpg or b''
+
+
+_depth_engine = None
+
+def get_depth_engine():
+    global _depth_engine
+    if _depth_engine is None:
+        _depth_engine = DepthEngine()
+    return _depth_engine
