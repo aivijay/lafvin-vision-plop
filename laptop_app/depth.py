@@ -100,7 +100,17 @@ class _ONNXEngine:
         input_t = np.transpose(img_bgr, (2, 0, 1))[np.newaxis, ...].astype(np.uint8)
         # ONNX outputs [1, 1, ENCODER_TARGET, ENCODER_TARGET]
         depth = self.session.run(None, {'input': input_t})[0][0, 0]  # [ET, ET]
-        # Resize back to original resolution
+
+        # Letterbox crop: same as PyTorch path — remove padding before resize
+        if orig_h > orig_w:
+            new_h, new_w = ENCODER_TARGET, int(orig_w * ENCODER_TARGET / orig_h)
+        else:
+            new_h, new_w = int(orig_h * ENCODER_TARGET / orig_w), ENCODER_TARGET
+        pad_h = ENCODER_TARGET - new_h
+        pt = pad_h // 2
+        depth = depth[pt:pt+new_h, :]  # crop padded rows
+
+        # Resize cropped depth back to original resolution
         depth = cv2.resize(depth, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
         return depth
 
@@ -121,9 +131,9 @@ class DepthEngine:
         self.session = None
         self._onnx = None
         self._calib = None
-        self._colorize_lut = self._build_colorize_lut()
         self._cached_colorized_jpg = b''
         self._depth_dist_history = []  # max 3 recent distance_to_obstacle_cm readings
+        self._build_colorize_lut()
         self.config = MODEL_CONFIGS[encoder]
 
     # ── Model loading ──────────────────────────────────────────────────────────
@@ -342,23 +352,30 @@ class DepthEngine:
     # ── Colorization ──────────────────────────────────────────────────────────
 
     def _build_colorize_lut(self):
-        """Pre-compute a 512-entry rainbow LUT for depth colorization."""
-        lut = np.zeros((512, 3), dtype=np.uint8)
-        for i in range(512):
-            t = i / 511.0
-            if t < 0.25:
-                c = int(255 * t * 4)
-                lut[i] = [c, 0, 255]
-            elif t < 0.5:
-                c = int(255 * (t - 0.25) * 4)
-                lut[i] = [255, c, 255 - c]
-            elif t < 0.75:
-                c = int(255 * (t - 0.5) * 4)
-                lut[i] = [255 - c, 255, 0]
-            else:
-                c = int(255 * (t - 0.75) * 4)
-                lut[i] = [0, 255 - c, c]
-        return lut
+        # Spectrum: red=far, black=near
+        # Black → Purple → Blue → Green → Yellow → Orange → Red
+        stops = [
+            (0, 0, 0),         # 0%:   Black   (near)
+            (139, 0, 255),     # 17%:  Purple
+            (0, 0, 255),       # 29%:  Blue
+            (0, 255, 0),       # 43%:  Green
+            (255, 255, 0),     # 57%:  Yellow
+            (255, 127, 0),     # 71%:  Orange
+            (255, 0, 0),       # 100%: Red     (far)
+        ]
+        n = 256
+        self._spectrum_lut = np.zeros((n, 3), dtype=np.uint8)
+        segs = len(stops) - 1
+        for i in range(n):
+            t = i / (n - 1)
+            seg = min(int(t * segs), segs - 1)
+            local_t = (t - seg / segs) * segs
+            c0, c1 = stops[seg], stops[seg + 1]
+            self._spectrum_lut[i] = [
+                int(c0[0] + (c1[0] - c0[0]) * local_t),
+                int(c0[1] + (c1[1] - c0[1]) * local_t),
+                int(c0[2] + (c1[2] - c0[2]) * local_t),
+            ]
 
     def _colorize_depth_to_jpg(self, raw_depth, w, h) -> bytes:
         """Colorize raw depth array to JPEG, cache result. No inference."""
@@ -368,16 +385,24 @@ class DepthEngine:
             vmax = float(np.max(valid))
             if vmax <= vmin:
                 vmax = vmin + 5.0
-            depth_norm = np.clip((raw_depth - vmin) / (vmax - vmin) * 511, 0, 511).astype(np.uint8)
+            depth_norm = np.clip((raw_depth - vmin) / (vmax - vmin) * 255, 0, 255).astype(np.uint8)
         else:
             depth_norm = np.zeros((h, w), dtype=np.uint8)
 
-        rgba = np.zeros((h, w, 3), dtype=np.uint8)
-        rgba[:, :, 0] = self._colorize_lut[depth_norm, 2]
-        rgba[:, :, 1] = self._colorize_lut[depth_norm, 1]
-        rgba[:, :, 2] = self._colorize_lut[depth_norm, 0]
-        self._cached_colorized_jpg = cv2.imencode('.jpg', rgba, [cv2.IMWRITE_JPEG_QUALITY, 85])[1].tobytes()
+        # Apply spectrum LUT: red=far (high), black=near (low)
+        # imencode expects BGR — convert from RGB
+        colorized_bgr = cv2.cvtColor(self._spectrum_lut[depth_norm], cv2.COLOR_RGB2BGR)
+        self._cached_colorized_jpg = cv2.imencode('.jpg', colorized_bgr, [cv2.IMWRITE_JPEG_QUALITY, 85])[1].tobytes()
         return self._cached_colorized_jpg
 
     def get_colorized_jpg(self) -> bytes:
-        return self._cached_colorized_jpg
+        return self._cached_colorized_jpg or b''
+
+
+_depth_engine = None
+
+def get_depth_engine():
+    global _depth_engine
+    if _depth_engine is None:
+        _depth_engine = DepthEngine()
+    return _depth_engine

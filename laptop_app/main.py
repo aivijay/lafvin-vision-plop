@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-LAFVIN Vision HE — Laptop App (full web dashboard)
+LAFVIN Vision PLOP — Laptop App (full web dashboard)
 All depth analysis runs HERE on the laptop, not on the Pi.
 """
 import os, sys, time, json, base64, io, asyncio, threading
@@ -19,7 +19,7 @@ from depth import get_depth_engine, load_calibration, save_calibration
 from robot_client import RobotClient
 import torch
 
-app = FastAPI(title="LAFVIN Vision HE", version="0.1.0")
+app = FastAPI(title="LAFVIN Vision PLOP", version="0.1.0")
 
 STATIC_DIR = Path(__file__).parent / "static"
 STATIC_DIR.mkdir(exist_ok=True)
@@ -100,7 +100,7 @@ async def depth_analyze_colorized(request: Request):
 
         jpg_bytes = base64.b64decode(image_b64)
         engine = get_depth_engine()
-        color_jpg = engine.get_colorized_depth_jpg(jpg_bytes)
+        color_jpg = engine.get_colorized_jpg()
         return Response(
             content=color_jpg,
             media_type="image/jpeg"
@@ -117,7 +117,7 @@ async def depth_colorized_jpg():
     try:
         from depth import get_depth_engine
         engine = get_depth_engine()
-        jpg = engine.get_colorized_depth_jpg(b'')
+        jpg = engine.get_colorized_jpg()
         if not jpg:
             return Response(content=b"", status_code=204)
         return Response(content=jpg, media_type="image/jpeg")
